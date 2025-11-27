@@ -4,30 +4,45 @@ from discord.ext import commands
 from status_bot import StatusMonitor
 import requests
 from io import BytesIO
+from status_bot import StatusMonitor, create_setting_command
+from game_monitor import GameMonitor, create_gamesetup_command
+from game_monitor import (
+    GameMonitor,
+    create_gamesetup_command,
+    create_gamelist_command,
+    create_testgamealerts_command,
+    create_newgame_command,
+    create_fixegame_command,
+    # create_resetgames_command
+)
 
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# @bot.event
-# async def on_ready():
-#     guild = discord.Object(id=GUILD_ID)
-#     await bot.tree.sync(guild=guild)
-#     print(f"{bot.user} is online and commands are synced!")
-
-from status_bot import StatusMonitor, create_setting_command
-
 @bot.event
 async def on_ready():
     guild = discord.Object(id=GUILD_ID)
 
-    # instantiate the monitor
+    # Instantiate the monitors
     monitor = StatusMonitor(bot)
+    game_monitor = GameMonitor(bot)
 
-    # add the /setting command for the guild only (instant visibility)
+    # Status monitor commands
     bot.tree.add_command(create_setting_command(monitor), guild=guild)
 
-    # sync commands for this guild
+    # Game monitor commands (owner only)
+    bot.tree.add_command(create_gamesetup_command(game_monitor), guild=guild)
+    bot.tree.add_command(create_testgamealerts_command(game_monitor), guild=guild)
+    # bot.tree.add_command(create_resetgames_command(game_monitor), guild=guild)
+    bot.tree.add_command(create_newgame_command(game_monitor), guild=guild)
+    bot.tree.add_command(create_fixegame_command(game_monitor), guild=guild)
+
+
+    # Public command for everyone
+    bot.tree.add_command(create_gamelist_command(game_monitor), guild=guild)
+
+    # Sync commands
     await bot.tree.sync(guild=guild)
 
     print(f"{bot.user} is online and commands are synced!")
