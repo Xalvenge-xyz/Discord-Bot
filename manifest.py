@@ -13,6 +13,8 @@ from game_monitor import (
     create_testgamealerts_command,
     create_newgame_command,
     create_fixegame_command,
+    create_gamesearch_command,
+    create_updategame_command,
     # create_resetgames_command
 )
 
@@ -37,11 +39,12 @@ async def on_ready():
     # bot.tree.add_command(create_resetgames_command(game_monitor), guild=guild)
     bot.tree.add_command(create_newgame_command(game_monitor), guild=guild)
     bot.tree.add_command(create_fixegame_command(game_monitor), guild=guild)
+    bot.tree.add_command(create_updategame_command(monitor))
 
 
     # Public command for everyone
     bot.tree.add_command(create_gamelist_command(game_monitor), guild=guild)
-
+    bot.tree.add_command(create_gamesearch_command(game_monitor), guild=guild)
     # Sync commands
     await bot.tree.sync(guild=guild)
 

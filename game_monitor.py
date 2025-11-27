@@ -8,10 +8,12 @@ import json
 import os
 import re
 from typing import List, Dict, Any, Optional
+from playwright.async_api import async_playwright
 
 CONFIG_FILE = "game_config.json"
 GAMES_JSON_URL = "https://generator.ryuu.lol/files/games.json"
 FIXES_PAGE_URL = "https://generator.ryuu.lol/fixes"
+FIXES_JSON_FILE = "fixes_cache.json"
 
 # Tunables
 REQUEST_TIMEOUT = 8
@@ -82,6 +84,66 @@ class GameMonitor:
             return None
         except Exception:
             return None
+        
+
+    # ---------- Playwright scraper for fixes ----------
+    async def scrape_fixes_with_playwright(self) -> List[Dict[str, Any]]:
+        """
+        Scrape fixes from https://generator.ryuu.lol/fixes and cache to JSON.
+        """
+        fixes = []
+        try:
+            from playwright.async_api import async_playwright
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.goto("https://generator.ryuu.lol/fixes", timeout=15000)
+                await page.wait_for_selector(".file-item", timeout=10000)
+
+                file_items = await page.query_selector_all(".file-item")
+                for item in file_items:
+                    name_el = await item.query_selector(".file-name")
+                    size_el = await item.query_selector(".file-size")
+                    href = await item.get_attribute("href") or ""
+
+                    name = await name_el.inner_text() if name_el else None
+                    size = await size_el.inner_text() if size_el else ""
+
+                    if name:
+                        title = re.sub(r'\.(zip|rar|7z|tar\.gz)$', '', name, flags=re.I).strip()
+                        if href.startswith("/"):
+                            href = "https://generator.ryuu.lol" + href
+                        fixes.append({"title": title, "download": href, "size": size})
+
+                await browser.close()
+
+            # Save to cache JSON
+            self.save_fixes_cache(fixes)
+
+        except Exception as e:
+            print("[ERROR] Playwright scrape failed:", e)
+            # fallback to cached JSON
+            fixes = self.load_fixes_cache()
+
+        return fixes
+
+    def load_fixes_cache(self) -> List[Dict[str, Any]]:
+        if os.path.exists("fixes_cache.json"):
+            try:
+                with open("fixes_cache.json", "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print("[ERROR] Failed to load fixes JSON:", e)
+        return []
+
+    def save_fixes_cache(self, fixes: List[Dict[str, Any]]):
+        try:
+            with open("fixes_cache.json", "w", encoding="utf-8") as f:
+                json.dump(fixes, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print("[ERROR] Failed to save fixes JSON:", e)
+
 
     # ---------- games (fast JSON) ----------
     async def fetch_games(self):
@@ -177,19 +239,22 @@ class GameMonitor:
         embed.set_footer(text="Steam Manifest Bot • Powered by JAY CAPARIDA AKA XALVENGE D.")
         return embed
 
-    def make_fix_embed(self, name: str, download_url: str, size: str) -> Embed:
-        """
-        Simpler embed for fixes: title + download link (per your instruction).
-        """
-        embed = Embed(
+    def make_fix_embed(self, name: str, download_url: str, size: str, image: Optional[str] = None):
+        embed = discord.Embed(
             title=f"🛠️ {name}",
             description=f"📥 [Download ZIP]({download_url})\n{('• Size: ' + size) if size else ''}",
-            color=Color.green()
+            color=discord.Color.green()
         )
+
+        # Set image inside the embed if file exists
+        if image and os.path.exists(image):
+            embed.set_image(url=f"attachment://{os.path.basename(image)}")  # THIS makes it appear inside the embed
+
         embed.set_footer(text="Fix posted by Steam Manifest Bot • XALVENGE D.")
         return embed
 
-    async def safe_send(self, channel_id: int, embed: Embed):
+
+    async def safe_send(self, channel_id: int, embed: Embed, local_file: Optional[str] = None):
         if not channel_id:
             return
         channel = self.bot.get_channel(channel_id)
@@ -197,16 +262,17 @@ class GameMonitor:
             try:
                 channel = await self.bot.fetch_channel(channel_id)
             except Exception:
-                channel = None
-        if not channel:
-            print(f"[ERROR] Channel {channel_id} not found for posting.")
-            return
+                return
         try:
-            await channel.send(embed=embed)
+            if local_file and os.path.exists(local_file):
+                await channel.send(embed=embed, file=discord.File(local_file))
+            else:
+                await channel.send(embed=embed)
         except discord.Forbidden:
             print(f"[ERROR] Missing access to channel {channel_id}")
         except Exception as e:
             print(f"[ERROR] Failed to send embed to {channel_id}: {e}")
+
 
     # ---------- processing ----------
     async def process_games_new_updated(self):
@@ -214,96 +280,98 @@ class GameMonitor:
         if not games:
             return
 
-        current_keys = set()
-        mapping = {}
-        # key by name (title) primarily
+        new_post_queue = []
+        update_post_queue = []
+
+        current_map = {}
+
         for g in games:
-            name = (g.get("title") or g.get("name") or "").strip()
+            title = (g.get("title") or g.get("name") or "").strip()
             appid = str(g.get("appid") or g.get("id") or "N/A")
-            image = g.get("img") or g.get("image") or g.get("header_image") or None
-            if not name:
-                name = f"Unknown Game ({appid})"
-            key = name
-            current_keys.add(key)
-            mapping[key] = {"name": name, "appid": appid, "img": image}
+            image = g.get("img") or g.get("image") or g.get("header_image")
 
-        new_keys = current_keys - self.seen_new
-        update_keys = current_keys - self.seen_update
+            if not title:
+                title = f"Unknown Game ({appid})"
 
-        ch_new = self.config.get("channel_id_new")
-        ch_update = self.config.get("channel_id_update")
+            current_map[title] = {"appid": appid, "image": image}
 
-        # Post NEW (automatic)
-        if ch_new and new_keys:
-            for k in sorted(new_keys):
-                e = mapping.get(k)
-                if not e:
-                    continue
-                embed = self.make_game_embed(e["name"], e["appid"], e["img"], "NEW")
-                await self.safe_send(ch_new, embed)
+            # NEW GAME
+            if title not in self.seen_new:
+                new_post_queue.append(title)
 
-        # Post UPDATED (automatic) - avoid reposting ones just sent as NEW
-        if ch_update and update_keys:
-            for k in sorted(update_keys):
-                if k in new_keys:
-                    continue
-                e = mapping.get(k)
-                if not e:
-                    continue
-                embed = self.make_game_embed(e["name"], e["appid"], e["img"], "UPDATED")
-                await self.safe_send(ch_update, embed)
+            # UPDATED GAME (REAL UPDATE)
+            else:
+                old_data = self.config.get("game_cache", {}).get(title, {})
+                if old_data != {"appid": appid, "image": image}:
+                    update_post_queue.append(title)
 
-        # update seen sets and save
-        if new_keys:
-            self.seen_new.update(new_keys)
-        if update_keys:
-            self.seen_update.update(update_keys)
-        if new_keys or update_keys:
-            self.save_config()
+        # ---- SEND NEW GAMES ----
+        if new_post_queue and self.config.get("channel_id_new"):
+            for title in sorted(new_post_queue):
+                data = current_map[title]
+                embed = self.make_game_embed(title, data["appid"], data["image"], "NEW")
+                await self.safe_send(self.config["channel_id_new"], embed)
+
+            self.seen_new.update(new_post_queue)
+
+        # ---- SEND TRUE UPDATED GAMES ----
+        if update_post_queue and self.config.get("channel_id_update"):
+            for title in sorted(update_post_queue):
+                data = current_map[title]
+                embed = self.make_game_embed(title, data["appid"], data["image"], "UPDATED")
+                await self.safe_send(self.config["channel_id_update"], embed)
+
+            self.seen_update.update(update_post_queue)
+
+        # ---- SAVE CACHE FOR UPDATE DETECTION ----
+        self.config["game_cache"] = current_map
+        self.save_config()
+
+
 
     async def process_fixes(self):
-        fixes = await self.fetch_fixes()
+        fixes = await self.scrape_fixes_with_playwright()
         if not fixes:
             return
 
+        new_fix_list = []
         current_titles = set()
-        mapping = {}
+
         for f in fixes:
-            name = (f.get("title") or f.get("name") or "").strip()
-            download = f.get("download") or f.get("url") or ""
-            size = f.get("size") or ""
-            if not name:
-                continue
-            key = name
-            current_titles.add(key)
-            mapping[key] = {"title": name, "download": download, "size": size}
+            title = f.get("title")
+            download = f.get("download")
+            size = f.get("size")
 
-        new_fixed = current_titles - self.seen_fixed
-        ch_fixed = self.config.get("channel_id_fixed")
+            current_titles.add(title)
 
-        if ch_fixed and new_fixed:
-            for k in sorted(new_fixed):
-                e = mapping.get(k)
-                if not e:
-                    continue
-                embed = self.make_fix_embed(e["title"], e["download"], e["size"])
-                await self.safe_send(ch_fixed, embed)
+            if title not in self.seen_fixed:
+                new_fix_list.append((title, download, size))
 
-        if new_fixed:
-            self.seen_fixed.update(new_fixed)
-            self.save_config()
+        # NO NEW FIX = NO EMBED
+        if not new_fix_list:
+            return
 
-    async def check_for_new_games(self):
-        # first new/updated, then fixes
-        await self.process_games_new_updated()
-        await self.process_fixes()
+        ch = self.config.get("channel_id_fixed")
+        if not ch:
+            return
+
+        for title, dl, size in new_fix_list:
+            embed = self.make_fix_embed(title, dl, size)
+            await self.safe_send(ch, embed)
+
+        self.seen_fixed.update([x[0] for x in new_fix_list])
+        self.save_config()
+
+
 
     # ---------- tasks loop ----------
     @tasks.loop(minutes=LOOP_INTERVAL_MINUTES)
     async def monitor_loop(self):
         await self.bot.wait_until_ready()
         try:
-            await self.check_for_new_games()
+            # automatic alerts
+            await self.process_games_new_updated()  # new & updated games
+            await self.process_fixes()             # fixes
         except Exception as e:
             print(f"[ERROR] Monitor loop exception: {e}")
 
@@ -363,33 +431,67 @@ def create_gamesetup_command(monitor: GameMonitor):
 
 def create_testgamealerts_command(monitor: GameMonitor):
     async def testgamealerts(interaction: discord.Interaction):
+        # Only allow server owner
         if interaction.user.id != interaction.guild.owner_id:
-            await interaction.response.send_message("❌ Only the server owner can use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Only the server owner can use this command.", ephemeral=True
+            )
             return
+
+        await interaction.response.defer(ephemeral=True)  # defer for longer processing
 
         sent = []
-        for feature, key in (("New", "channel_id_new"), ("Updated", "channel_id_update"), ("Fixed", "channel_id_fixed")):
-            channel_id = monitor.config.get(key)
+        # Path to local GIF/banner
+        banner_path = "img/giphy (1).gif"
+
+        # Feature-channel mapping
+        features = {
+            "New": "channel_id_new",
+            "Updated": "channel_id_update",
+            "Fixed": "channel_id_fixed"
+        }
+
+        for feature_name, config_key in features.items():
+            channel_id = monitor.config.get(config_key)
             if not channel_id:
                 continue
-            test_embed = Embed(
-                title=f"🎮 TEST {feature.upper()} GAME ALERT",
-                description="📦 **Manifest for App ID:** `123456`",
-                color=Color.green() if feature == "Fixed" else Color.blurple()
+
+            # Embed for the test alert
+            if os.path.exists(banner_path):
+                embed = discord.Embed(
+                    title=f"🎮 TEST {feature_name.upper()} GAME ALERT",
+                    description="📦 **Manifest for App ID:** `123456`",
+                    color=discord.Color.green() if feature_name == "Fixed" else discord.Color.blurple()
+                )
+                embed.set_image(url=f"attachment://{os.path.basename(banner_path)}")
+            else:
+                embed = discord.Embed(
+                    title=f"🎮 TEST {feature_name.upper()} GAME ALERT",
+                    description="📦 **Manifest for App ID:** `123456`",
+                    color=discord.Color.green() if feature_name == "Fixed" else discord.Color.blurple()
+                )
+
+            embed.set_footer(text="Steam Manifest Bot • XALVENGE D.")
+
+            # Send via safe_send (handles missing permissions etc.)
+            await monitor.safe_send(channel_id, embed, local_file=banner_path if os.path.exists(banner_path) else None)
+            sent.append(feature_name)
+
+        # Final confirmation
+        if sent:
+            await interaction.followup.send(
+                f"✅ Test alerts sent for: {', '.join(sent)}", ephemeral=True
             )
-            test_embed.set_image(url="https://i.imgur.com/OBaYQvr.jpeg")
-            test_embed.set_footer(text="Steam Manifest Bot • XALVENGE D.")
-            await monitor.safe_send(channel_id, test_embed)
-            sent.append(feature)
+        else:
+            await interaction.followup.send(
+                "⚠ No channels configured. Run `/gamesetup` first.", ephemeral=True
+            )
 
-        if not sent:
-            await interaction.response.send_message("⚠ No channels configured. Run `/gamesetup` first.", ephemeral=True)
-            return
-
-        await interaction.response.send_message(f"✅ Test alerts sent for: {', '.join(sent)}", ephemeral=True)
-
-    return app_commands.Command(name="testgamealerts", description="Send a test game alert embed (Owner Only)", callback=testgamealerts)
-
+    return app_commands.Command(
+        name="testgamealerts",
+        description="Send a test game alert embed (Owner Only)",
+        callback=testgamealerts
+    )
 
 def create_gamelist_command(monitor: GameMonitor):
     async def gamelist(interaction: discord.Interaction):
@@ -481,24 +583,122 @@ def create_newgame_command(monitor: GameMonitor):
 
     return app_commands.Command(name="newgame", description="Show newly added games (does not modify automatic seen sets)", callback=newgame)
 
+def create_updategame_command(monitor: GameMonitor):
+    async def updategame(interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        games = await monitor.fetch_games()
+        if not games:
+            await interaction.followup.send("❌ Failed to load game list.", ephemeral=True)
+            return
+
+        results = []
+        for g in games:
+            name = (g.get("title") or g.get("name") or "").strip()
+            appid = str(g.get("appid") or g.get("id") or "N/A")
+            img = g.get("img") or g.get("image") or g.get("header_image") or None
+
+            if name not in monitor.seen_update:
+                results.append((name, appid, img))
+
+        if not results:
+            await interaction.followup.send("⚠ No UPDATED games found.", ephemeral=True)
+            return
+
+        for name, appid, img in results[:10]:
+            embed = monitor.make_game_embed(name, appid, img, "UPDATED")
+            await interaction.followup.send(embed=embed)
+
+    return app_commands.Command(name="updategame", description="Show updated games (manual, does not affect alerts)", callback=updategame)
+
 
 def create_fixegame_command(monitor: GameMonitor):
     async def fixegame(interaction: discord.Interaction):
         """
-        Manual command: fetch all fixes and show them (does not modify seen_fixed).
+        Fetch all fixes via Playwright and show them (does not modify seen_fixed).
         """
         await interaction.response.defer()
-        fixes = await monitor.fetch_fixes()
+        fixes = await monitor.scrape_fixes_with_playwright()
         if not fixes:
             await interaction.followup.send("❌ Failed to load fixes.", ephemeral=True)
             return
 
-        # send ALL fixes
+        # path to default local banner
+        default_banner = "img/giphy.gif"  # <-- your local file
+
+        # send ALL fixes with professional embed
         for f in fixes:
-            embed = monitor.make_fix_embed(f.get("title"), f.get("download"), f.get("size", ""))
-            await interaction.followup.send(embed=embed)
+            # Pass the banner file to the embed so it appears inside
+            embed = monitor.make_fix_embed(
+                f.get("title"),
+                f.get("download"),
+                f.get("size", ""),
+                image=default_banner  # <-- pass the file here
+            )
+            # Send embed with the same file attached
+            await monitor.safe_send(
+                monitor.config.get("channel_id_fixed"),
+                embed,
+                local_file=default_banner
+            )
 
-        await interaction.followup.send(f"✅ {len(fixes)} fixes found — all displayed.", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ {len(fixes)} fixes found — all displayed.", ephemeral=True
+        )
 
-    return app_commands.Command(name="fixegame", description="Show current fixed games (does not modify automatic seen sets)", callback=fixegame)
+    return app_commands.Command(
+        name="fixegame",
+        description="Show current fixed games (does not modify automatic seen sets)",
+        callback=fixegame
+    )
 
+def create_gamesearch_command(monitor):
+    @app_commands.command(name="gamesearch", description="Search games by title or App ID")
+    @app_commands.describe(name="The game name or App ID to search for")  # description
+    @app_commands.rename(name="game")  # <--- this changes the option name in Discord
+    async def gamesearch(interaction: discord.Interaction, name: str):
+        query = name  # internally we use 'query'
+        await interaction.response.defer()
+        games = await monitor.fetch_games()
+        if not games:
+            await interaction.followup.send("❌ Failed to load game list.", ephemeral=True)
+            return
+
+        # filter matches
+        matches = []
+        for g in games:
+            title = g.get("title") or g.get("name") or "Unknown Game"
+            appid = str(g.get("appid") or g.get("id") or "N/A")
+            if query.lower() in title.lower() or query in appid:
+                matches.append(f"● **{title}** — `{appid}`")
+
+        if not matches:
+            await interaction.followup.send(f"⚠ No games found matching: `{query}`", ephemeral=True)
+            return
+
+        # paginate results
+        chunks = [matches[i:i+80] for i in range(0, len(matches), 80)]
+        embeds = []
+        for idx, chunk in enumerate(chunks, start=1):
+            text = "\n".join(chunk)
+            embed = Embed(
+                title=f"🔍 Search results for '{query}' — Page {idx}/{len(chunks)}",
+                description=text[:4096],
+                color=Color.blurple()
+            )
+            embed.set_footer(text="Steam Manifest Bot • XALVENGE D.")
+            embeds.append(embed)
+
+        # send first page
+        msg = await interaction.followup.send(embed=embeds[0])
+        msg = await msg.fetch()
+
+        # edit subsequent pages
+        for embed in embeds[1:]:
+            await asyncio.sleep(2)
+            try:
+                await msg.edit(embed=embed)
+            except Exception as e:
+                print("[ERROR] Failed to edit message:", e)
+
+    return gamesearch
